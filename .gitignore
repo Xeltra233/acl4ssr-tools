@@ -1,0 +1,12 @@
+# Node fragments (contain real node credentials) and generated output
+*.txt
+*.acl4ssr-full.yaml
+
+# Conversion log
+convert.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
