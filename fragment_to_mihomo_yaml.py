@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.request import Request, urlopen
 from urllib.parse import urlparse
 
@@ -463,14 +463,124 @@ def build_acl4ssr_rules(
     return providers, rules
 
 
+RULE_SET_PREFIX = "rule-set:"
+
+
+def rule_set_ref_name(value: Any) -> str | None:
+    """Return the provider name when ``value`` is a ``rule-set:<name>`` reference."""
+    if isinstance(value, str) and value.startswith(RULE_SET_PREFIX):
+        name = value[len(RULE_SET_PREFIX) :].strip()
+        return name or None
+    return None
+
+
+def iter_rule_set_refs(node: Any) -> Iterator[str]:
+    """Yield every provider name referenced by ``rule-set:`` inside ``node``."""
+    if isinstance(node, str):
+        name = rule_set_ref_name(node)
+        if name:
+            yield name
+    elif isinstance(node, dict):
+        for key, value in node.items():
+            name = rule_set_ref_name(key)
+            if name:
+                yield name
+            yield from iter_rule_set_refs(value)
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            yield from iter_rule_set_refs(item)
+
+
+def prune_rule_set_refs(node: Any, available: set[str]) -> Any:
+    """Drop every ``rule-set:<name>`` that ``available`` cannot resolve."""
+    if isinstance(node, str):
+        name = rule_set_ref_name(node)
+        if name and name not in available:
+            return None
+        return node
+    if isinstance(node, dict):
+        cleaned: dict[Any, Any] = {}
+        for key, value in node.items():
+            name = rule_set_ref_name(key)
+            if name:
+                if name in available:
+                    cleaned[key] = value
+                continue
+            new_value = prune_rule_set_refs(value, available)
+            if new_value is None and rule_set_ref_name(value):
+                continue
+            cleaned[key] = new_value
+        return cleaned
+    if isinstance(node, list):
+        items: list[Any] = []
+        for item in node:
+            new_item = prune_rule_set_refs(item, available)
+            if new_item is None and rule_set_ref_name(item):
+                continue
+            items.append(new_item)
+        return items
+    return node
+
+
+def keep_dns_rule_sets(
+    dns: Any,
+    providers: dict[str, dict[str, Any]],
+    source_providers: dict[str, dict[str, Any]],
+) -> tuple[Any, list[str]]:
+    """Keep every ``rule-set:`` reference inside ``dns`` resolvable.
+
+    The ACL4SSR template replaces ``rule-providers`` wholesale, so a source
+    profile whose DNS policy points at one of its own providers (Mesl ships
+    ``rule-set:cn-domain``) would make Mihomo refuse to load the result with
+    ``not found rule-set``. Providers the source profile defines are carried
+    over; references that nothing can resolve are pruned so it still starts.
+    """
+    if not isinstance(dns, dict):
+        return dns, []
+
+    carried: list[str] = []
+    for name in sorted(set(iter_rule_set_refs(dns))):
+        if name in providers:
+            continue
+        definition = source_providers.get(name)
+        if isinstance(definition, dict):
+            providers[name] = dict(definition)
+            carried.append(name)
+
+    dangling = sorted(set(iter_rule_set_refs(dns)) - set(providers))
+    if not dangling:
+        return dns, carried
+
+    available = set(providers)
+    for name in dangling:
+        print(
+            f"warning: dropped dangling {RULE_SET_PREFIX}{name} reference from dns",
+            file=sys.stderr,
+        )
+    return prune_rule_set_refs(dns, available), carried
+
+
 def apply_acl4ssr_template(profile: dict[str, Any], template: Template) -> dict[str, Any]:
     names = proxy_names(profile)
     if not names:
         raise SystemExit("No proxies found in input.")
 
     profile = dict(profile)
+    source_providers = {
+        str(name): definition
+        for name, definition in (profile.get("rule-providers") or {}).items()
+        if isinstance(definition, dict)
+    }
+
     profile["proxy-groups"] = build_acl4ssr_proxy_groups(template.groups, names)
     providers, rules = build_acl4ssr_rules(template.rulesets)
+
+    if profile.get("dns") is not None:
+        dns, carried = keep_dns_rule_sets(profile["dns"], providers, source_providers)
+        profile["dns"] = dns
+        for name in carried:
+            print(f"info: kept dns rule-set provider: {name}", file=sys.stderr)
+
     if providers:
         profile["rule-providers"] = providers
     elif "rule-providers" in profile:
@@ -524,6 +634,30 @@ def apply_defaults(profile: dict[str, Any]) -> dict[str, Any]:
         profile["rules"] = [f"MATCH,{choose_match_target(profile)}"]
 
     return profile
+
+ACL4SSR_PROVIDER_MARK = "ACL4SSR/ACL4SSR"
+ACL4SSR_GROUP_MARKS = ("漏网之鱼", "兜底")
+
+
+def has_acl4ssr_rules(profile: dict[str, Any]) -> bool:
+    """True when this profile already carries the ACL4SSR group and rule set.
+
+    Re-converting such a file is a no-op that only rewrites it, so callers can
+    skip it instead of regenerating identical output.
+    """
+    for definition in (profile.get("rule-providers") or {}).values():
+        if not isinstance(definition, dict):
+            continue
+        if ACL4SSR_PROVIDER_MARK in str(definition.get("url") or ""):
+            return True
+
+    for group in profile.get("proxy-groups") or []:
+        if not isinstance(group, dict):
+            continue
+        name = str(group.get("name") or "")
+        if any(mark in name for mark in ACL4SSR_GROUP_MARKS):
+            return True
+    return False
 
 def validate_profile(profile: dict[str, Any]) -> list[str]:
     """Return structural problems that would make Mihomo reject the profile."""

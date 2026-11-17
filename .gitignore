@@ -1,6 +1,11 @@
 # Node fragments (contain real node credentials) and generated output
 *.txt
+*.txt.bak
 *.acl4ssr-full.yaml
+
+# Full profiles dropped in for conversion (contain real node credentials)
+/Mesl-*.yaml
+/official-*.yaml
 
 # Conversion log
 convert.log

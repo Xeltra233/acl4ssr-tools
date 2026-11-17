@@ -10,6 +10,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 OUTPUT_SUFFIX = ".acl4ssr-full.yaml"
+INPUT_SUFFIXES = (".txt", ".yaml", ".yml")
 ACL4SSR_REMOTE_TEMPLATE = (
     "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/"
     "Clash/config/ACL4SSR_Online_Full.ini"
@@ -28,14 +29,35 @@ def output_path_for(source: Path) -> Path:
     return source.with_suffix(OUTPUT_SUFFIX)
 
 
-def convert_one(source: Path, template_source: str) -> None:
+def is_output_path(path: Path) -> bool:
+    return path.name.endswith(OUTPUT_SUFFIX)
+
+
+def find_sources() -> list[Path]:
+    """Every convertible input in this folder: node .txt plus full .yaml profiles."""
+    sources: list[Path] = []
+    for path in sorted(SCRIPT_DIR.iterdir()):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in INPUT_SUFFIXES:
+            continue
+        if is_output_path(path):
+            continue
+        sources.append(path)
+    return sources
+
+
+def convert_one(source: Path, template_source: str) -> bool:
     module = converter()
     text = module.read_text(str(source))
     profile = module.load_profile(text)
+    source_dns = profile.get("dns")
     names = module.proxy_names(profile)
     if not names:
         raise ValueError("no proxies found")
-
+    if module.has_acl4ssr_rules(profile):
+        print(f"SKIP: {source.name} 已套用 ACL4SSR 规则，跳过不重新生成")
+        return False
     renames = module.dedupe_proxy_names(profile)
     profile = module.apply_acl4ssr_template(profile, module.read_template(template_source))
     profile = module.apply_defaults(profile)
@@ -50,6 +72,12 @@ def convert_one(source: Path, template_source: str) -> None:
     print(f"OK: {source.name} -> {target.name} ({len(names)} proxies)")
     if renames:
         print(f"     renamed {len(renames)} duplicate proxy name(s)")
+    if isinstance(source_dns, dict):
+        final_dns = profile.get("dns") or {}
+        policy = final_dns.get("nameserver-policy")
+        detail = f", {len(policy)} nameserver-policy entry(s)" if isinstance(policy, dict) else ""
+        print(f"     kept dns: {final_dns.get('enhanced-mode', 'n/a')}{detail}")
+    return True
 
 
 def main() -> int:
@@ -64,27 +92,39 @@ def main() -> int:
 
     template_source = ACL4SSR_REMOTE_TEMPLATE
     print(f"Remote template: {template_source}")
-    txt_files = sorted(
-        path
-        for path in SCRIPT_DIR.glob("*.txt")
-        if path.is_file() and output_path_for(path).name != path.name
-    )
+    sources = find_sources()
 
-    if not txt_files:
-        print("\nNo .txt files found in this folder.")
+    if not sources:
+        print(f"\nNo {' / '.join(INPUT_SUFFIXES)} files found in this folder.")
         return 0
 
-    print(f"\nFound {len(txt_files)} txt file(s).")
+    collisions: dict[str, Path] = {}
+    for source in sources:
+        target = str(output_path_for(source))
+        if target in collisions:
+            print(
+                f"\nERROR: {collisions[target].name} and {source.name} "
+                f"both map to {Path(target).name}"
+            )
+            return 1
+        collisions[target] = source
+
+    print(f"\nFound {len(sources)} input file(s).")
     failed = 0
-    for source in txt_files:
+    converted = 0
+    skipped = 0
+    for source in sources:
         try:
-            convert_one(source, template_source)
+            if convert_one(source, template_source):
+                converted += 1
+            else:
+                skipped += 1
         except Exception:
             failed += 1
             print(f"\nFAILED: {source.name}")
             print(traceback.format_exc().rstrip())
 
-    print(f"\nDone. Success: {len(txt_files) - failed}, Failed: {failed}")
+    print(f"\nDone. Converted: {converted}, Skipped: {skipped}, Failed: {failed}")
     return 1 if failed else 0
 
 
